@@ -22,6 +22,7 @@ from functools import partial
 
 import numpy as np
 import paddle
+import paddle.distributed as dist
 import paddle.incubate as incubate
 import paddle.nn as nn
 import paddle.nn.functional as F
@@ -54,6 +55,15 @@ try:
     from paddle.incubate.nn.layer.fused_dropout_add import FusedDropoutAdd
 except:
     FusedDropoutAdd = None
+
+
+from paddle.distributed.auto_parallel.intermediate.tensor_parallel import (
+    ColWiseParallel,
+    RowWiseParallel,
+    SequenceParallelBegin,
+    SequenceParallelDisable,
+    SequenceParallelEnd,
+)
 
 __all__ = [
     "GPTModelNet",
@@ -327,7 +337,7 @@ class MultiHeadAttentionNet(nn.Layer):
         if self.enable_recompute and self.config.recompute_granularity == "core_attn" and has_gradient:
             outputs = recompute(attention_func, q, k, v, attention_mask, output_attentions, use_reentrant=False)
         else:
-            outputs = attention_func(q, k, v, attention_mask=attention_mask, output_attentions=output_attentions)
+            outputs = attention_func(q, k, v, attention_mask, output_attentions)
 
         if output_attentions:
             out, weights = outputs
@@ -441,10 +451,10 @@ class TransformerDecoder(nn.Layer):
             else:
                 outputs = decoder_layer(
                     output,
-                    attention_mask=attention_mask,
-                    use_cache=use_cache,
-                    past_key_value=past_key_values[i] if past_key_values is not None else None,
-                    output_attentions=output_attentions,
+                    attention_mask,
+                    use_cache,
+                    past_key_values[i] if past_key_values is not None else None,
+                    output_attentions,
                 )
 
             # outputs = hidden_states if both use_cache and output_attentions are False
@@ -635,7 +645,6 @@ class GPTEmbeddingsNet(nn.Layer):
                 inputs_embeddings = self.word_embeddings(input_ids)
             else:
                 input_shape = inputs_embeddings.shape[:-1]
-
             if position_ids is None:
                 ones = paddle.ones(input_shape, dtype="int64")
                 seq_length = paddle.cumsum(ones, axis=-1)
@@ -870,9 +879,9 @@ class GPTModelNet(GPTPretrainedModelNet):
         self.eol_token_id = config.eol_token_id
         self.vocab_size = config.vocab_size
 
-        self.bias = paddle.tril(
-            paddle.ones([1, 1, config.max_position_embeddings, config.max_position_embeddings], dtype="int64")
-        )
+        # self.bias = paddle.tril(
+        #     paddle.ones([1, 1, config.max_position_embeddings, config.max_position_embeddings], dtype="int64")
+        # )
         self.embeddings = GPTEmbeddingsNet(config)
 
         decoder_layers = nn.LayerList()
@@ -883,6 +892,8 @@ class GPTModelNet(GPTPretrainedModelNet):
             config,
             decoder_layers,
         )
+
+        self.global_layer = GlobalNet(self.config)
 
     def get_layer_ipp(self, layer_index):
         mesh = fleet.auto.get_mesh()
@@ -1022,7 +1033,9 @@ class GPTModelNet(GPTPretrainedModelNet):
         # input_shape => bs, seq_len
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.decoder.layers))
-
+        causal_mask = paddle.tril(
+            paddle.ones([1, 1, self.config.max_position_embeddings, self.config.max_position_embeddings], dtype="int64")
+        )
         if position_ids is None:
             past_length = 0
             if past_key_values[0] is not None:
@@ -1031,38 +1044,22 @@ class GPTModelNet(GPTPretrainedModelNet):
             position_ids = paddle.arange(past_length, input_shape[-1] + past_length, dtype="int64")
             position_ids = position_ids.unsqueeze(0)
             position_ids = paddle.expand(position_ids, input_shape)
+        attention_mask = self.global_layer(attention_mask,causal_mask,input_shape,past_key_values)
         embedding_output = self.embeddings(
-            input_ids=input_ids, position_ids=position_ids, inputs_embeddings=inputs_embeds
+            input_ids, position_ids, inputs_embeds
         )
-        # TODO, use registered buffer
-        length = input_shape[-1]
-        if past_key_values[0] is not None:
-            cache_length = past_key_values[0][0].shape[1]
-            length = length + cache_length
-        else:
-            cache_length = 0
-
-        causal_mask = self.bias[:, :, cache_length:length, :length]
-        if attention_mask is not None:
-            if attention_mask.dtype != paddle.int64:
-                attention_mask = paddle.cast(attention_mask, dtype=paddle.int64)
-            if len(attention_mask.shape) == 2:
-                attention_mask = attention_mask[:, None, None, :]
-            attention_mask = (1.0 - (attention_mask & causal_mask)) * -1e4
-        else:
-            attention_mask = (1.0 - causal_mask) * -1e4
 
         # The tensor returned by triu not in static graph.
         attention_mask.stop_gradient = True
 
         outputs = self.decoder(
             embedding_output,
-            attention_mask=attention_mask,
-            use_cache=use_cache,
-            past_key_values=past_key_values,
-            output_hidden_states=output_hidden_states,
-            output_attentions=output_attentions,
-            return_dict=return_dict,
+            attention_mask,
+            use_cache,
+            past_key_values,
+            output_hidden_states,
+            output_attentions,
+            return_dict,
         )
 
         if output_hidden_states:
@@ -1159,8 +1156,9 @@ class GPTLMHeadNet(nn.Layer):
 
         if self.config.sequence_parallel:
             hidden_states = paddle.reshape(hidden_states, [-1, self.config.seq_length, self.config.hidden_size])
-
-        logits = paddle.matmul(hidden_states, self.weight, transpose_y=self.transpose_y)
+        #NOTE(zhangwl):temp no support share_weight in intermediate_api
+        y = dist.reshard(self.weight,get_mesh(-1), [dist.Replicate(), dist.Shard(0)])
+        logits = paddle.matmul(hidden_states, y, transpose_y=self.transpose_y)
         return logits
 
 
@@ -1246,14 +1244,14 @@ class GPTForCausalLMNet(GPTPretrainedModelNet):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         outputs = self.gpt(
             input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            past_key_values=past_key_values,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            position_ids,
+            attention_mask,
+            inputs_embeds,
+            use_cache,
+            past_key_values,
+            output_attentions,
+            output_hidden_states,
+            return_dict,
         )
 
         if isinstance(outputs, input_type):
@@ -1271,12 +1269,12 @@ class GPTForCausalLMNet(GPTPretrainedModelNet):
             outputs = (logits,) + outputs[1:]
             return ((loss,) + outputs) if loss is not None else outputs
         return CausalLMOutputWithCrossAttentions(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            cross_attentions=outputs.cross_attentions,
+            loss,
+            logits,
+            outputs.past_key_values,
+            outputs.hidden_states,
+            outputs.attentions,
+            outputs.cross_attentions,
         )
 
     def prepare_fast_entry(self, kwargs):
@@ -1329,5 +1327,52 @@ class GPTForCausalLMNet(GPTPretrainedModelNet):
             attention_mask = paddle.ones_like(input_ids, dtype="int64")
         return paddle.unsqueeze(attention_mask, axis=[1, 2])
 
+    def auto_dist_config(self, prefix=""):
+        if prefix != "":
+            assert prefix.endswith(".")
+        config = {
+            "mp_config": {
+                "parallelize_plan": {
+                    f"{prefix}gpt.embeddings.position_embeddings": ColWiseParallel(),
+                    f"{prefix}gpt.decoder.layers.*.self_attn.qkv_proj": ColWiseParallel(),
+                    f"{prefix}gpt.decoder.layers.*.self_attn.q_proj": ColWiseParallel(),
+                    f"{prefix}gpt.decoder.layers.*.self_attn.k_proj": ColWiseParallel(),
+                    f"{prefix}gpt.decoder.layers.*.self_attn.v_proj": ColWiseParallel(),
+                    f"{prefix}gpt.decoder.layers.*.self_attn.out_proj": RowWiseParallel(),
+                    f"{prefix}gpt.decoder.layers.*.linear1": ColWiseParallel(),
+                    f"{prefix}gpt.decoder.layers.*.linear2": RowWiseParallel(),
+                }
+            },
+            "pp_config": {
+                            "split_spec": f"{prefix}gpt.decoder.layers",
+                            "global_spec": f"{prefix}gpt.global_layer" ,
+                        },
+        }
+        return config
+
+class GlobalNet(nn.Layer):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.config = config
+
+    def forward(self, attention_mask, causal_mask, input_shape, past_key_values):
+        # TODO, use registered buffer
+        length = input_shape[-1]
+        if past_key_values[0] is not None:
+            cache_length = past_key_values[0][0].shape[1]
+            length = length + cache_length
+        else:
+            cache_length = 0
+
+        causal_mask = causal_mask[:, :, cache_length:length, :length]
+        if attention_mask is not None:
+            if attention_mask.dtype != paddle.int64:
+                attention_mask = paddle.cast(attention_mask, dtype=paddle.int64)
+            if len(attention_mask.shape) == 2:
+                attention_mask = attention_mask[:, None, None, :]
+            attention_mask = (1.0 - (attention_mask & causal_mask)) * -1e4
+        else:
+            attention_mask = (1.0 - causal_mask) * -1e4
+        return attention_mask
 
 GPTLMHeadModelNet = GPTForCausalLMNet
