@@ -33,6 +33,38 @@ __all__ = []
 # language models using model parallelism[J]. arXiv preprint arXiv:1909.08053, 2019. (https://arxiv.org/abs/1909.08053)
 
 
+def get_current_amp_state():
+    """获取当前 AMP 状态的完整信息"""
+    state = {}
+
+    try:
+        from paddle.amp.auto_cast import _g_amp_state_
+
+        if _g_amp_state_ is not None:
+            state.update(_g_amp_state_)
+    except ImportError:
+        pass
+
+    try:
+        from paddle.fluid.dygraph.base import _dygraph_tracer
+
+        tracer = _dygraph_tracer()
+        if tracer is not None:
+            state.update(
+                {
+                    '_amp_level': tracer._amp_level,
+                    '_amp_dtype': tracer._amp_dtype,
+                    '_use_promote': getattr(tracer, '_use_promote', None),
+                }
+            )
+            white_list, black_list = tracer._get_amp_op_list()
+            state.update({'_white_list': white_list, '_black_list': black_list})
+    except ImportError:
+        pass
+
+    return state
+
+
 def is_fused_matmul_bias_supported():
     return hasattr(core.eager.ops.legacy, 'fused_gemm_epilogue')
 
@@ -65,7 +97,7 @@ class VocabParallelEmbedding(paddle.nn.Layer):
     Examples:
         .. code-block:: python
 
-            >>> import paddle
+            >>> import paddlex
             >>> from paddle.distributed import fleet
 
             >>> class SimpleMPNet(paddle.nn.Layer):
@@ -219,16 +251,20 @@ class InnerOverlapLinear(paddle.autograd.PyLayer):
     @staticmethod
     def backward(ctx, dy):
         x, weight, bias = ctx.saved_tensor()
-        if dy.dtype == weight.dtype:
-            dx = paddle.matmul(dy, weight, transpose_y=True)
+        if x.stop_gradient is True:
+            dx = None
+            task = None
         else:
-            dx = paddle.matmul(
-                dy, paddle.cast(weight, dtype=dy.dtype), transpose_y=True
+            if dy.dtype == weight.dtype:
+                dx = paddle.matmul(dy, weight, transpose_y=True)
+            else:
+                dx = paddle.matmul(
+                    dy, paddle.cast(weight, dtype=dy.dtype), transpose_y=True
+                )
+            op_type = _get_reduce_op(ReduceOp.SUM, "_c_identity")
+            task = ctx.model_parallel_group.process_group.all_reduce(
+                dx, op_type, sync_op=False
             )
-        op_type = _get_reduce_op(ReduceOp.SUM, "_c_identity")
-        task = ctx.model_parallel_group.process_group.all_reduce(
-            dx, op_type, sync_op=False
-        )
         # Using small operation to preempt GPU SMs for all_reduce to achieve overlap.
         if int(os.getenv("CUDA_DEVICE_MAX_CONNECTIONS", "0")) != 1:
             global _raise_cuda_env_unset_warning
@@ -258,7 +294,7 @@ class InnerOverlapLinear(paddle.autograd.PyLayer):
                     ) = paddle._C_ops.fused_linear_param_grad_add(
                         x, dy, weight.main_grad, None, True, False
                     )
-                    task.wait()
+                    task.wait() if task is not None else None
                     return dx, None
                 else:
                     if weight.grad is not None:
@@ -268,7 +304,7 @@ class InnerOverlapLinear(paddle.autograd.PyLayer):
                         ) = paddle._C_ops.fused_linear_param_grad_add(
                             x, dy, weight.grad, None, False, False
                         )
-                        task.wait()
+                        task.wait() if task is not None else None
                         return dx, None
                     else:
                         (
@@ -277,7 +313,7 @@ class InnerOverlapLinear(paddle.autograd.PyLayer):
                         ) = paddle._C_ops.fused_linear_param_grad_add(
                             x, dy, None, None, False, False
                         )
-                        task.wait()
+                        task.wait() if task is not None else None
                         return dx, dw
 
             if hasattr(weight, "main_grad") and hasattr(bias, "main_grad"):
@@ -292,7 +328,7 @@ class InnerOverlapLinear(paddle.autograd.PyLayer):
                     True,
                     True,
                 )
-                task.wait()
+                task.wait() if task is not None else None
                 return dx, None, None
             else:
                 if weight.grad is not None:
@@ -303,7 +339,7 @@ class InnerOverlapLinear(paddle.autograd.PyLayer):
                     ) = paddle._C_ops.fused_linear_param_grad_add(
                         x, dy, weight.grad, bias.grad, False, True
                     )
-                    task.wait()
+                    task.wait() if task is not None else None
                     return dx, None, None
                 else:
                     # When main_grad is not enabled and gradient_accumulation is used, the grad is not initialized for the first acc step.
@@ -313,7 +349,7 @@ class InnerOverlapLinear(paddle.autograd.PyLayer):
                     ) = paddle._C_ops.fused_linear_param_grad_add(
                         x, dy, None, None, False, True
                     )
-                    task.wait()
+                    task.wait() if task is not None else None
                     return dx, dw, dbias
         else:
             dy = dy.reshape([-1, dy.shape[-1]])
@@ -323,11 +359,11 @@ class InnerOverlapLinear(paddle.autograd.PyLayer):
                 transpose_x=True,
             )
             if bias is None:
-                task.wait()
+                task.wait() if task is not None else None
                 return dx, dw
             else:
                 dbias = paddle.sum(dy, axis=0)
-                task.wait()
+                task.wait() if task is not None else None
                 return dx, dw, dbias
 
 

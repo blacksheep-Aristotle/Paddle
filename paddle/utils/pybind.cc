@@ -31,7 +31,7 @@ bool PyCheckTensor(PyObject* obj) {
   }
   return PyObject_TypeCheck(obj, p_tensor_type);
 }
-
+bool PyIsNone(PyObject* obj) { return obj == Py_None; }
 void ShareTensor(PyObject* src, PyObject* dst) {
   if (PyObject_TypeCheck(src, p_tensor_type) &&
       PyObject_TypeCheck(dst, p_tensor_type)) {

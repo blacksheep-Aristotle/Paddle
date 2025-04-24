@@ -39,7 +39,8 @@ typedef struct {
 
 // Internal use only, to expose the Tensor type to Python.
 bool PyCheckTensor(PyObject* obj);
-
+// Internal use only, to expose the Tensor type to Python.
+bool PyIsNone(PyObject* obj);
 // Share Tensor for inplace.
 void ShareTensor(PyObject* src, PyObject* dst);
 

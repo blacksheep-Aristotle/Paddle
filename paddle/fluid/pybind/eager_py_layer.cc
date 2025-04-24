@@ -244,6 +244,8 @@ PyObject* pylayer_method_apply(PyObject* cls,
           {&(reinterpret_cast<TensorObject*>(obj)->tensor)});  // NOLINT
       bool stop_gradient =
           autograd_meta == nullptr ? true : autograd_meta->StopGradient();
+      VLOG(1) << "DEBUG forward input tensor " << i << " stop_gradient "
+              << stop_gradient;
       if (!stop_gradient) {
         require_any_grad = true;
       }
@@ -267,6 +269,8 @@ PyObject* pylayer_method_apply(PyObject* cls,
         auto autograd_meta = egr::EagerUtils::nullable_autograd_meta(tensors);
         for (auto iter : autograd_meta) {
           bool stop_gradient = iter == nullptr ? true : iter->StopGradient();
+          VLOG(1) << "DEBUG forward input tensors " << i << " stop_gradient "
+                  << stop_gradient;
           if (!stop_gradient) {
             require_any_grad = true;
           }
@@ -294,6 +298,8 @@ PyObject* pylayer_method_apply(PyObject* cls,
         auto autograd_meta = egr::EagerUtils::nullable_autograd_meta(tensors);
         for (auto iter : autograd_meta) {
           bool stop_gradient = iter == nullptr ? true : iter->StopGradient();
+          VLOG(1) << "DEBUG forward input tensors " << i << " stop_gradient "
+                  << stop_gradient;
           if (!stop_gradient) {
             require_any_grad = true;
           }
@@ -485,8 +491,10 @@ PyObject* pylayer_method_apply(PyObject* cls,
         for (auto t : inputs_tensor[i]) {
           tmp.push_back(t);
         }
+        VLOG(1) << "DEBUG Pylayer set SetGradOutMeta " << i;
         grad_node->SetGradOutMeta(tmp, i);
       } else {
+        VLOG(1) << "DEBUG Pylayer set SetGradOutMeta " << i;
         grad_node->SetGradOutMeta(*inputs_tensor[i][0], i);
       }
     }
@@ -579,6 +587,42 @@ PyObject* call_unpack_hook(PyLayerObject* self) {
     }
   }
 
+  auto saved_value_size = PyTuple_GET_SIZE(unpacked_value);
+
+  for (Py_ssize_t i = 0; i < saved_value_size; i++) {
+    PyObject* obj = PyTuple_GET_ITEM(unpacked_value, i);
+    if (PyCheckTensor(obj)) {
+      VLOG(1) << "after unpack_hook tensor stop_gradient"
+              << reinterpret_cast<egr::AutogradMeta*>(
+                     paddle::pybind::UnSafeGetTensorFromPyObject(obj)
+                         .get_autograd_meta())
+                     ->StopGradient();
+    } else if (PyList_Check(obj)) {
+      Py_ssize_t len = PyList_Size(obj);
+      for (Py_ssize_t j = 0; j < len; j++) {
+        PyObject* o = PyList_GetItem(obj, j);
+        if (PyCheckTensor(o)) {
+          VLOG(1) << "after unpack_hook tensor stop_gradient"
+                  << reinterpret_cast<egr::AutogradMeta*>(
+                         paddle::pybind::UnSafeGetTensorFromPyObject(o)
+                             .get_autograd_meta())
+                         ->StopGradient();
+        }
+      }
+    } else if (PyTuple_Check(obj)) {
+      Py_ssize_t len = PyTuple_Size(obj);
+      for (Py_ssize_t j = 0; j < len; j++) {
+        PyObject* o = PyTuple_GetItem(obj, j);
+        if (PyCheckTensor(o)) {
+          VLOG(1) << "after unpack_hook tensor stop_gradient"
+                  << reinterpret_cast<egr::AutogradMeta*>(
+                         paddle::pybind::UnSafeGetTensorFromPyObject(o)
+                             .get_autograd_meta())
+                         ->StopGradient();
+        }
+      }
+    }
+  }
   return unpacked_value;
 }
 
@@ -617,6 +661,11 @@ void call_pack_hook(PyLayerObject* self, PyObject* value) {
   for (Py_ssize_t i = 0; i < saved_value_size; i++) {
     PyObject* obj = PyTuple_GET_ITEM(saved_value, i);
     if (PyCheckTensor(obj)) {
+      VLOG(1) << "before packhook tensor stop_gradient"
+              << reinterpret_cast<egr::AutogradMeta*>(
+                     paddle::pybind::UnSafeGetTensorFromPyObject(obj)
+                         .get_autograd_meta())
+                     ->StopGradient();
       PyTuple_SET_ITEM(packed_value,
                        i,
                        reinterpret_cast<PyObject*>(
@@ -630,6 +679,11 @@ void call_pack_hook(PyLayerObject* self, PyObject* value) {
       for (Py_ssize_t j = 0; j < len; j++) {
         PyObject* o = PyList_GetItem(obj, j);
         if (PyCheckTensor(o)) {
+          VLOG(1) << "before packhook tensor stop_gradient"
+                  << reinterpret_cast<egr::AutogradMeta*>(
+                         paddle::pybind::UnSafeGetTensorFromPyObject(o)
+                             .get_autograd_meta())
+                         ->StopGradient();
           PyTuple_SET_ITEM(tmp_list,
                            j,
                            reinterpret_cast<PyObject*>(
@@ -650,6 +704,11 @@ void call_pack_hook(PyLayerObject* self, PyObject* value) {
       for (Py_ssize_t j = 0; j < len; j++) {
         PyObject* o = PyTuple_GetItem(obj, j);
         if (PyCheckTensor(o)) {
+          VLOG(1) << "before packhook tensor stop_gradient"
+                  << reinterpret_cast<egr::AutogradMeta*>(
+                         paddle::pybind::UnSafeGetTensorFromPyObject(o)
+                             .get_autograd_meta())
+                         ->StopGradient();
           PyTuple_SET_ITEM(tmp_tuple,
                            j,
                            reinterpret_cast<PyObject*>(

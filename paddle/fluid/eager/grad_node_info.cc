@@ -380,8 +380,12 @@ void GradNodeBase::SetGradOutMeta(const paddle::Tensor& fwd_in,
   auto& meta = metas[0];
   // Set Stop_gradient
   if (fwd_in_meta) {
+    VLOG(1) << "DEBUG " << this->name() << " meta " << slot_rank
+            << " set stop gradient " << fwd_in_meta->StopGradient();
     meta.SetStopGradient(fwd_in_meta->StopGradient());
   } else {
+    VLOG(1) << "DEBUG " << this->name() << " meta " << slot_rank
+            << " set stop gradient " << true << " becasue fwd_in_meta is none";
     meta.SetStopGradient(true);
   }
   // Set Adj Edges
@@ -578,6 +582,12 @@ void GradNodeBase::SetGradOutMeta(const std::vector<paddle::Tensor>& fwd_in,
     // Set Stop_gradient
     if (fwd_in_meta) {
       meta.SetStopGradient(fwd_in_meta->StopGradient());
+      VLOG(1) << "DEBUG " << this->name() << " meta " << slot_rank
+              << " set stop gradient " << fwd_in_meta->StopGradient();
+    } else {
+      VLOG(1) << "DEBUG " << this->name() << " meta " << slot_rank
+              << " set stop gradient " << false
+              << " becasue fwd_in_meta is none";
     }
     // Set Adj Edges
     if (fwd_in_meta && !fwd_in_meta->StopGradient()) {
@@ -658,6 +668,12 @@ void GradNodeBase::SetGradOutMeta(
     // Set Stop_gradient
     if (fwd_in_meta) {
       meta.SetStopGradient(fwd_in_meta->StopGradient());
+      VLOG(1) << "DEBUG " << this->name() << " meta " << slot_rank
+              << " set stop gradient " << fwd_in_meta->StopGradient();
+    } else {
+      VLOG(1) << "DEBUG " << this->name() << " meta " << slot_rank
+              << " set stop gradient " << false
+              << " becasue fwd_in_meta is none";
     }
     // Set Adj Edges
     if (fwd_in_meta && !fwd_in_meta->StopGradient()) {
